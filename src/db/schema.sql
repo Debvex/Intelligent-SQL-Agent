@@ -1,0 +1,3 @@
+-- DDL: 5 tables (customers, products, orders, order_items, reviews)
+-- FKs, ENUMs, indexes, readonly_user grant
+-- Mounted to /docker-entrypoint-initdb.d/ for auto-execution on first Docker start

@@ -1,0 +1,11 @@
+.git
+.venv
+venv
+env
+__pycache__
+*.pyc
+.env
+.sisyphus
+*.egg-info
+dist
+build

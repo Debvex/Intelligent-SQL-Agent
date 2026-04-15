@@ -1,0 +1,52 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    entrypoint: ["bash", "scripts/app-entrypoint.sh"]
+    networks:
+      - agent-net
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: sqlagent
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./src/db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - ./src/db/seed.sql:/docker-entrypoint-initdb.d/02_seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sqlagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agent-net
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    entrypoint: ["bash", "scripts/ollama-init.sh"]
+    networks:
+      - agent-net
+
+volumes:
+  ollama_data:
+
+networks:
+  agent-net:

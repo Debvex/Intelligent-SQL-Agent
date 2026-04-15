@@ -1,0 +1,2 @@
+-- Realistic e-commerce data: 20+ customers, 15+ products, 30+ orders, etc.
+-- Auto-executed on first Postgres container start
