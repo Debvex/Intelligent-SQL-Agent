@@ -28,7 +28,7 @@ ENTRY → AGENT → VALIDATE → EXECUTE → OBSERVE → REFLECT → END
 
 - Single agent, single StateGraph. No multi-agent orchestration.
 - 5 nodes with conditional edges: `agent`, `validate`, `execute`, `observe`, `reflect`.
-- `AgentState` TypedDict lives in `src/agent/state.py`.
+- `AgentState` TypedDict lives in `src/agent/graph.py`.
 - HITL: `interrupt_before=["execute"]` in `.compile()` — always requires `MemorySaver` checkpointer.
 - Session memory: `MemorySaver` (in-memory only, state lost on restart — do not add Redis).
 - Every `graph.invoke()` must pass `config={"configurable": {"thread_id": session_id}}`.
@@ -64,7 +64,7 @@ Intelligent SQL Agent/
 ├── requirements.txt              # Pinned versions
 │
 ├── scripts/
-│   ├── model_spike.py            # Task 0: validate llama3.2:3b SQL quality (5 test queries)
+│   ├── model_spike.py            # Validate llama3.2:3b SQL quality (5 test queries)
 │   ├── ollama-init.sh            # Pull llama3.2:3b on first Docker start
 │   └── app-entrypoint.sh         # Poll Ollama readiness then start uvicorn
 │
@@ -78,47 +78,21 @@ Intelligent SQL Agent/
     │
     ├── api/
     │   ├── __init__.py
-    │   ├── app.py                 # FastAPI instance, CORS, lifespan, router includes
-    │   └── routes/
-    │       ├── __init__.py
-    │       ├── health.py          # GET /health — DB + Ollama connectivity check
-    │       ├── query.py           # POST /query — main query endpoint, cache check, graph invoke
-    │       ├── approve.py         # POST /query/approve — resume HITL-interrupted graph
-    │       ├── stream.py          # POST /query/stream — SSE of node-by-node events
-    │       ├── schema.py          # GET /schema — all tables with columns + descriptions
-    │       └── history.py        # GET /history/{session_id} — conversation from checkpointer
+    │   └── app.py                # ALL API logic: FastAPI app, CORS, lifespan, ALL endpoints
     │
     ├── agent/
-    │   ├── __init__.py
-    │   ├── graph.py               # StateGraph: node definitions, edges, compile with MemorySaver
-    │   ├── state.py               # AgentState TypedDict (messages, query, sql, results, errors, etc.)
-    │   ├── cache.py               # QueryCache — in-memory LRU, keyed by (session_id, normalized_query)
-    │   ├── error_handlers.py      # classify_error(), should_retry(), build_retry_message() — 4 error classes
-    │   ├── tracing.py             # LangSmith setup — sets env vars if LANGCHAIN_TRACING_V2=true
-    │   │
-    │   ├── nodes/
-    │   │   ├── __init__.py
-    │   │   ├── agent.py           # AGENT node — ChatOllama LLM call, tool binding, decides SQL or conversation
-    │   │   ├── validate.py       # VALIDATE node — SQL safety checks, block DDL/DML/injection, table existence
-    │   │   ├── execute.py        # EXECUTE node — run SQL via execute_query(), error classification, HITL check
-    │   │   ├── observe.py        # OBSERVE node — format results as markdown table or summary sentence
-    │   │   └── reflect.py       # REFLECT node — retry decision, error context injection, iteration/retry limits
-    │   │
-    │   ├── tools/
-    │   │   ├── __init__.py
-    │   │   └── sql_tools.py      # @tool functions: get_schema_info(), execute_query()
-    │   │
-    │   └── prompts/
-    │       ├── __init__.py
-    │       ├── system.py          # System prompt — SQL-only instructions, role definition
-    │       ├── sql_few_shot.py   # 5-8 NL→SQL example pairs for in-context learning
-    │       └── schema_desc.py    # Human-written dict: table/column descriptions (mandatory for LLM)
+    │   ├── graph.py              # EVERYTHING: AgentState, 5 nodes, routing, graph wiring
+    │   ├── tools.py              # get_schema_info(), execute_query()
+    │   ├── prompts.py            # SYSTEM_PROMPT, FEW_SHOT_EXAMPLES, SCHEMA_DESCRIPTION, COLUMN_DESCRIPTIONS
+    │   ├── cache.py              # QueryCache — in-memory LRU, keyed by (session_id, query)
+    │   ├── error_handlers.py     # classify_error(), should_retry(), build_retry_message()
+    │   └── tracing.py            # LangSmith setup — sets env vars if LANGCHAIN_TRACING_V2=true
     │
     └── db/
         ├── __init__.py
-        ├── connection.py          # SQLAlchemy sync engine, connection pool, context manager
-        ├── schema.sql             # DDL — 5 tables, FKs, ENUMs, indexes, readonly_user grant
-        └── seed.sql               # Realistic data — 20+ customers, 15+ products, 30+ orders, etc.
+        ├── connection.py          # SQLAlchemy sync engine, connection pool
+        ├── schema.sql             # DDL — 5 tables, FKs, ENUMs, indexes, readonly_user
+        └── seed.sql               # Realistic e-commerce data
 ```
 
 ## Functionalities by module
@@ -133,26 +107,16 @@ Intelligent SQL Agent/
 
 ### `src/agent/` — Core agent
 
-**State** (`state.py`): `AgentState` TypedDict carrying the full pipeline state:
-- `messages` (conversation history), `query` (original NL), `generated_sql`, `validation_result`, `query_result`, `result_summary`, `error`, `error_class`, `retry_count`, `iteration_count`, `is_approved` (HITL flag).
+**Graph** (`graph.py`): **Everything in one file** — `AgentState` TypedDict, 5 node functions (agent, validate, execute, observe, reflect), conditional routing functions, and graph compilation. All part of the same pipeline, edited together.
 
-**Graph** (`graph.py`): Wires all 5 nodes with conditional edges. Compiles with `MemorySaver` checkpointer and `interrupt_before=["execute"]` for HITL. Every invoke uses `thread_id` for session isolation.
-
-**Nodes** (`nodes/`):
-- `agent.py`: Constructs prompt from system message + history (truncated to 20) + schema context + few-shot examples. Calls `ChatOllama` with `.bind_tools()`. If tool call → sets `generated_sql`. If conversational → sets `result_summary`.
-- `validate.py`: 5 checks — SQL starts with SELECT, no DDL/DML keywords, no injection patterns (`; DROP`, `UNION SELECT` from system tables), referenced tables exist, under 2000 chars. Sets `validation_result`.
-- `execute.py`: Checks validation passed + HITL approved. Calls `execute_query()` tool. Wraps in try/except for error classification (syntax, permission, timeout, no_results). Applies row limit cap.
-- `observe.py`: Pure formatting — markdown tables for small results, count summary for aggregates, graceful empty/error messages. Appends `AIMessage` to history.
-- `reflect.py`: Routes: success → END, error + retries left → AGENT with error context message, retries exhausted → END with failure, max iterations → END with timeout message. Increments `retry_count` on retry.
-
-**Tools** (`tools/sql_tools.py`): Two `@tool`-decorated LangChain tools:
-- `get_schema_info()`: Uses SQLAlchemy `inspect()` for live schema (tables, columns, types, FKs) + merges `schema_desc.py` descriptions. Returns structured dict.
+**Tools** (`tools.py`): Two functions (not `@tool` decorated yet, will be when wiring with LangGraph):
+- `get_schema_info()`: Uses SQLAlchemy `inspect()` for live schema (tables, columns, types, FKs) + merges `SCHEMA_DESCRIPTION` from prompts. Returns structured dict.
 - `execute_query(sql)`: Runs raw SQL via `text()`. Rejects non-SELECT. Applies `LIMIT` cap if missing. Enforces timeout. Returns `list[dict]`.
 
-**Prompts** (`prompts/`):
-- `system.py`: System prompt defining the agent as an SQL-only assistant for the e-commerce DB.
-- `sql_few_shot.py`: 5-8 NL→SQL pairs covering SELECT, JOIN, GROUP BY, ORDER BY + LIMIT, subquery. Critical for 3b model quality.
-- `schema_desc.py`: `SCHEMA_DESCRIPTION` and `COLUMN_DESCRIPTIONS` dicts — human-written plain-English annotations that augment DDL for the LLM. Not optional.
+**Prompts** (`prompts.py`): Three dicts in one file:
+- `SYSTEM_PROMPT`: Defines the agent as an SQL-only assistant.
+- `FEW_SHOT_EXAMPLES`: 7 NL→SQL pairs covering SELECT, JOIN, GROUP BY, ORDER BY + LIMIT, subquery.
+- `SCHEMA_DESCRIPTION` + `COLUMN_DESCRIPTIONS`: Human-written plain-English annotations that augment DDL for the LLM. Not optional.
 
 **Error handlers** (`error_handlers.py`): 4 error classes only — `syntax`, `permission`, `timeout`, `no_results` (plus `unknown`). `classify_error()` maps SQLAlchemy exceptions. `should_retry()` respects max_retries=2. `build_retry_message()` creates LLM-friendly retry context per error type.
 
@@ -162,15 +126,13 @@ Intelligent SQL Agent/
 
 ### `src/api/` — REST API
 
-**App** (`app.py`): FastAPI instance with CORS (allow all for dev), lifespan handler (calls `setup_tracing()`), includes all route modules.
-
-**Routes** (`routes/`):
-- `health.py` (`GET /health`): Returns `{status, db: "connected"|"disconnected", ollama: "ready"|"unavailable"}`. Checks DB via SELECT 1, Ollama via GET `/api/tags`.
-- `query.py` (`POST /query`): Accepts `{query, session_id?}`. Auto-generates UUID4 if no session_id. Checks cache → invoke graph → return `{status, sql, result_summary, result_data, session_id, metadata: {iterations, cached}}` or `{status: "pending_approval", proposed_sql, request_id}` for HITL. Errors return 200 with `{status: "error"}`.
-- `approve.py` (`POST /query/approve`): Accepts `{request_id, session_id, approved}`. Updates graph state `is_approved`, resumes execution via `graph.invoke(None, config)`. Returns completed results or rejection.
-- `stream.py` (`POST /query/stream`): Same input as `/query`. Uses `graph.astream_events()` for SSE — emits `event: agent|validate|execute|observe|complete` with node-specific data.
-- `schema.py` (`GET /schema`): Returns all 5 tables with columns, types, and schema descriptions.
-- `history.py` (`GET /history/{session_id}`): Reads `graph.get_state(config)` from checkpointer. Returns message array with roles and content.
+**App** (`app.py`): ALL API logic in one file — FastAPI instance, CORS, lifespan handler, and all 6 endpoints:
+- `GET /health` — Returns `{status, db: "connected"|"disconnected", ollama: "ready"|"unavailable"}`. Checks DB via SELECT 1, Ollama via GET `/api/tags`.
+- `POST /query` — Accepts `{query, session_id?}`. Auto-generates UUID4 if no session_id. Checks cache → invoke graph → return `{status, sql, result_summary, result_data, session_id, metadata: {iterations, cached}}` or `{status: "pending_approval", proposed_sql, request_id}` for HITL. Errors return 200 with `{status: "error"}`.
+- `POST /query/approve` — Accepts `{request_id, session_id, approved}`. Updates graph state `is_approved`, resumes execution via `graph.invoke(None, config)`. Returns completed results or rejection.
+- `POST /query/stream` — Same input as `/query`. Uses `graph.astream_events()` for SSE — emits `event: agent|validate|execute|observe|complete` with node-specific data.
+- `GET /schema` — Returns all 5 tables with columns, types, and schema descriptions.
+- `GET /history/{session_id}` — Reads `graph.get_state(config)` from checkpointer. Returns message array with roles and content.
 
 ### `scripts/` — Infrastructure
 
@@ -200,9 +162,11 @@ Intelligent SQL Agent/
 
 ## Must-know patterns
 
-**Schema description dict** (`src/agent/prompts/schema_desc.py`) is mandatory — the LLM needs plain-English table/column descriptions beyond DDL. Do not skip this.
+**Schema description dict** (`src/agent/prompts.py` → `SCHEMA_DESCRIPTION` + `COLUMN_DESCRIPTIONS`) is mandatory — the LLM needs plain-English table/column descriptions beyond DDL. Do not skip this.
 
-**Few-shot examples** (`src/agent/prompts/sql_few_shot.py`) — 5-8 NL→SQL pairs required for the 3b model to generate decent SQL.
+**Few-shot examples** (`src/agent/prompts.py` → `FEW_SHOT_EXAMPLES`) — 7 NL→SQL pairs required for the 3b model to generate decent SQL.
+
+**Everything in graph.py** — `AgentState`, all 5 node functions, routing functions, and graph wiring live in ONE file (`src/agent/graph.py`). This is intentional: they're all part of the same pipeline and you edit them together.
 
 **Error classes** — exactly 4: `syntax`, `permission`, `timeout`, `no_results` (plus `unknown`). Do not add more.
 
