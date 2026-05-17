@@ -2,7 +2,7 @@
 # Poll Ollama readiness then start uvicorn
 echo "Waiting for Ollama..."
 for i in $(seq 1 12); do
-  if curl -s http://ollama:11434/api/tags > /dev/null 2>&1; then
+  if curl -s http://127.0.0.1:11434 > /dev/null 2>&1; then
     echo "Ollama is ready!"
     break
   fi
